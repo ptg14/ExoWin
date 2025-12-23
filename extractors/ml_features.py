@@ -192,6 +192,9 @@ class MLFeaturesExtractor(BaseExtractor):
         except Exception:
             features['anomaly_score'] = 0.0
 
+        # DLL-specific features
+        features.update(self._extract_dll_features(pe))
+
         return features
 
     def _extract_file_features(self, pe: pefile.PE) -> Dict[str, Any]:
@@ -646,6 +649,142 @@ class MLFeaturesExtractor(BaseExtractor):
 
         return features
 
+    def _extract_dll_features(self, pe: pefile.PE) -> Dict[str, Any]:
+        """Extract DLL-specific features for ML"""
+        features = {}
+
+        features["dll_is_dll"] = 1 if pe.is_dll() else 0
+
+        if not pe.is_dll():
+            # Return default DLL features for non-DLL files
+            features.update({
+                "dll_char_aslr": 0,
+                "dll_char_dep": 0,
+                "dll_char_cfg": 0,
+                "dll_char_high_entropy": 0,
+                "dll_char_no_seh": 0,
+                "dll_char_force_integrity": 0,
+                "dll_security_score": 0,
+                "dll_export_count": 0,
+                "dll_export_named_count": 0,
+                "dll_export_ordinal_only_count": 0,
+                "dll_export_forwarded_count": 0,
+                "dll_export_forwarded_ratio": 0.0,
+                "dll_export_ordinal_ratio": 0.0,
+                "dll_suspicious_export_count": 0,
+                "dll_rundll_export_count": 0,
+                "dll_com_export_count": 0,
+                "dll_is_com": 0,
+                "dll_is_proxy": 0,
+                "dll_has_exports": 0,
+            })
+            return features
+
+        # DLL Characteristics features
+        try:
+            dll_char = pe.OPTIONAL_HEADER.DllCharacteristics
+            features["dll_char_aslr"] = 1 if dll_char & 0x0040 else 0
+            features["dll_char_dep"] = 1 if dll_char & 0x0100 else 0
+            features["dll_char_cfg"] = 1 if dll_char & 0x4000 else 0
+            features["dll_char_high_entropy"] = 1 if dll_char & 0x0020 else 0
+            features["dll_char_no_seh"] = 1 if dll_char & 0x0400 else 0
+            features["dll_char_force_integrity"] = 1 if dll_char & 0x0080 else 0
+
+            # Calculate security score
+            features["dll_security_score"] = (
+                features["dll_char_aslr"] * 25 +
+                features["dll_char_dep"] * 25 +
+                features["dll_char_cfg"] * 25 +
+                features["dll_char_high_entropy"] * 15 +
+                features["dll_char_force_integrity"] * 10
+            )
+        except Exception:
+            features["dll_char_aslr"] = 0
+            features["dll_char_dep"] = 0
+            features["dll_char_cfg"] = 0
+            features["dll_char_high_entropy"] = 0
+            features["dll_char_no_seh"] = 0
+            features["dll_char_force_integrity"] = 0
+            features["dll_security_score"] = 0
+
+        # Export features
+        try:
+            if hasattr(pe, 'DIRECTORY_ENTRY_EXPORT'):
+                exports = list(pe.DIRECTORY_ENTRY_EXPORT.symbols)
+                features["dll_export_count"] = len(exports)
+
+                named_count = sum(1 for e in exports if e.name)
+                features["dll_export_named_count"] = named_count
+                features["dll_export_ordinal_only_count"] = len(exports) - named_count
+
+                forwarded_count = sum(1 for e in exports if e.forwarder)
+                features["dll_export_forwarded_count"] = forwarded_count
+
+                if len(exports) > 0:
+                    features["dll_export_forwarded_ratio"] = round(forwarded_count / len(exports), 4)
+                    features["dll_export_ordinal_ratio"] = round((len(exports) - named_count) / len(exports), 4)
+                else:
+                    features["dll_export_forwarded_ratio"] = 0.0
+                    features["dll_export_ordinal_ratio"] = 0.0
+
+                # Check for suspicious export names
+                suspicious_count = 0
+                rundll_count = 0
+                com_count = 0
+
+                suspicious_keywords = ["inject", "hook", "payload", "shellcode", "decrypt", "encrypt",
+                                       "download", "upload", "keylog", "capture", "steal", "bypass"]
+                rundll_keywords = ["run", "exec", "execute", "main", "start", "entry", "launch"]
+                com_keywords = ["dllgetclassobject", "dllcanunloadnow", "dllregisterserver"]
+
+                for exp in exports:
+                    if exp.name:
+                        name_lower = exp.name.decode('utf-8').lower() if isinstance(exp.name, bytes) else str(exp.name).lower()
+
+                        if any(k in name_lower for k in suspicious_keywords):
+                            suspicious_count += 1
+                        if any(k in name_lower for k in rundll_keywords):
+                            rundll_count += 1
+                        if any(k in name_lower for k in com_keywords):
+                            com_count += 1
+
+                features["dll_suspicious_export_count"] = suspicious_count
+                features["dll_rundll_export_count"] = rundll_count
+                features["dll_com_export_count"] = com_count
+
+                # DLL type indicators
+                features["dll_is_com"] = 1 if com_count >= 2 else 0
+                features["dll_is_proxy"] = 1 if features.get("dll_export_forwarded_ratio", 0) > 0.5 else 0
+                features["dll_has_exports"] = 1 if len(exports) > 0 else 0
+            else:
+                features["dll_export_count"] = 0
+                features["dll_export_named_count"] = 0
+                features["dll_export_ordinal_only_count"] = 0
+                features["dll_export_forwarded_count"] = 0
+                features["dll_export_forwarded_ratio"] = 0.0
+                features["dll_export_ordinal_ratio"] = 0.0
+                features["dll_suspicious_export_count"] = 0
+                features["dll_rundll_export_count"] = 0
+                features["dll_com_export_count"] = 0
+                features["dll_is_com"] = 0
+                features["dll_is_proxy"] = 0
+                features["dll_has_exports"] = 0
+        except Exception:
+            features["dll_export_count"] = 0
+            features["dll_export_named_count"] = 0
+            features["dll_export_ordinal_only_count"] = 0
+            features["dll_export_forwarded_count"] = 0
+            features["dll_export_forwarded_ratio"] = 0.0
+            features["dll_export_ordinal_ratio"] = 0.0
+            features["dll_suspicious_export_count"] = 0
+            features["dll_rundll_export_count"] = 0
+            features["dll_com_export_count"] = 0
+            features["dll_is_com"] = 0
+            features["dll_is_proxy"] = 0
+            features["dll_has_exports"] = 0
+
+        return features
+
     def _extract_data_directory_features(self, pe: pefile.PE) -> Dict[str, Any]:
         """Extract data directory presence features"""
         data_dirs = [
@@ -737,5 +876,12 @@ class MLFeaturesExtractor(BaseExtractor):
             "dd_delay_import_present", "dd_delay_import_size",
             "dd_com_descriptor_present", "dd_com_descriptor_size",
             "dd_reserved_present", "dd_reserved_size",
+            # DLL-specific features
+            "dll_char_aslr", "dll_char_dep", "dll_char_cfg", "dll_char_high_entropy",
+            "dll_char_no_seh", "dll_char_force_integrity", "dll_security_score",
+            "dll_export_count", "dll_export_named_count", "dll_export_ordinal_only_count",
+            "dll_export_forwarded_count", "dll_export_forwarded_ratio", "dll_export_ordinal_ratio",
+            "dll_suspicious_export_count", "dll_rundll_export_count", "dll_com_export_count",
+            "dll_is_com", "dll_is_proxy", "dll_has_exports",
         ]
         return feature_names

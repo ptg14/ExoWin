@@ -9,6 +9,7 @@ from exowin.extractors.imports import ImportsExtractor
 from exowin.extractors.strings import StringsExtractor
 from exowin.extractors.disasm import DisasmExtractor
 from exowin.extractors.ml_features import MLFeaturesExtractor
+from exowin.extractors.dll_features import DLLFeaturesExtractor, DLLMLFeaturesExtractor
 
 __all__ = [
     "BaseExtractor",
@@ -19,4 +20,6 @@ __all__ = [
     "StringsExtractor",
     "DisasmExtractor",
     "MLFeaturesExtractor",
+    "DLLFeaturesExtractor",
+    "DLLMLFeaturesExtractor",
 ]

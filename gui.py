@@ -15,20 +15,30 @@ from tkinter import filedialog, messagebox
 import tkinter as tk
 from PIL import Image, ImageDraw, ImageTk
 import math
+import os
+import sys
+import threading
+import json
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+import datetime
+
+import customtkinter as ctk
+from tkinter import filedialog, messagebox
+import tkinter as tk
+from PIL import Image, ImageDraw, ImageTk
 
 # Add parent to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pefile
 from exowin.analyzer import ExoWinAnalyzer
-from exowin.extractors import MLFeaturesExtractor
+from exowin.extractors import MLFeaturesExtractor, DLLFeaturesExtractor
 from exowin.reporters import JSONReporter, HTMLReporter, MarkdownReporter, CSVReporter
-
 
 # Set appearance
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
-
 
 def create_app_icon(size=64):
     """Create a programmatic app icon with hexagon shape"""
@@ -88,7 +98,6 @@ def create_sidebar_logo(size=40):
 
     return img
 
-
 class StatCard(ctk.CTkFrame):
     """Stat card for dashboard"""
 
@@ -126,7 +135,6 @@ class StatCard(ctk.CTkFrame):
     def set_value(self, value: str):
         self.value_label.configure(text=value)
 
-
 class PEAnalyzerGUI(ctk.CTk):
     """ExoWin - Modern GUI"""
 
@@ -153,6 +161,7 @@ class PEAnalyzerGUI(ctk.CTk):
         # Initialize components
         self.analyzer = ExoWinAnalyzer()
         self.ml_extractor = MLFeaturesExtractor()
+        self.dll_extractor = DLLFeaturesExtractor()
         self.reporters = {
             "JSON": JSONReporter(),
             "HTML": HTMLReporter(),
@@ -242,7 +251,7 @@ class PEAnalyzerGUI(ctk.CTk):
 
         # Version
         self.version_label = ctk.CTkLabel(
-            self.sidebar, text="v1.0.0",
+            self.sidebar, text="v1.1.0",
             font=ctk.CTkFont(size=11),
             text_color=("gray50", "gray60")
         )
@@ -258,7 +267,7 @@ class PEAnalyzerGUI(ctk.CTk):
         # Top bar with file info and actions
         self._create_topbar()
 
-        # Content frames (we'll switch between these)
+        # Content frames
         self.content_frames = {}
         self._create_home_frame()
         self._create_analysis_frame()
@@ -288,13 +297,19 @@ class PEAnalyzerGUI(ctk.CTk):
         )
         self.btn_open.grid(row=0, column=2, padx=5, pady=10)
 
+
+        # Recursive checkbox
+        self.recursive_var = ctk.BooleanVar(value=False)
         self.btn_folder = ctk.CTkButton(
             self.topbar, text="Open Folder", width=130,
             command=self._open_folder, corner_radius=8,
             fg_color=("gray75", "gray30"),
             hover_color=("gray65", "gray40")
         )
-        self.btn_folder.grid(row=0, column=3, padx=5, pady=10)
+        self.btn_folder.grid(row=0, column=3, padx=(5,0), pady=10, sticky="w")
+        self.recursive_cb = ctk.CTkCheckBox(
+            self.topbar, text="Recursive", variable=self.recursive_var)
+        self.recursive_cb.grid(row=0, column=3, padx=(140,5), pady=10, sticky="w")
 
         self.btn_export = ctk.CTkButton(
             self.topbar, text="Export", width=100,
@@ -309,14 +324,14 @@ class PEAnalyzerGUI(ctk.CTk):
         frame = ctk.CTkFrame(self.main_container, corner_radius=15, fg_color="transparent")
         self.content_frames["home"] = frame
 
-        frame.grid_columnconfigure((0, 1, 2, 3), weight=1)
+        frame.grid_columnconfigure((0, 1, 2, 3, 4), weight=1)
 
         # Welcome header
         welcome = ctk.CTkLabel(
             frame, text="Welcome to ExoWin",
             font=ctk.CTkFont(size=28, weight="bold")
         )
-        welcome.grid(row=0, column=0, columnspan=4, pady=(0, 5), sticky="w")
+        welcome.grid(row=0, column=0, columnspan=5, pady=(0, 5), sticky="w")
 
         desc = ctk.CTkLabel(
             frame,
@@ -324,15 +339,16 @@ class PEAnalyzerGUI(ctk.CTk):
             font=ctk.CTkFont(size=14),
             text_color=("gray50", "gray60")
         )
-        desc.grid(row=1, column=0, columnspan=4, pady=(0, 30), sticky="w")
+        desc.grid(row=1, column=0, columnspan=5, pady=(0, 30), sticky="w")
 
         # Stat cards
         self.stat_cards = {}
 
         stats = [
-            ("features", "ML Features", "162", "blue"),
+            ("features", "ML Features", "181", "blue"),
             ("sections", "Sections", "0", "green"),
             ("imports", "Imports", "0", "orange"),
+            ("exports", "Exports", "0", "purple"),
             ("suspicious", "Suspicious", "0", "red"),
         ]
 
@@ -346,16 +362,16 @@ class PEAnalyzerGUI(ctk.CTk):
             frame, text="Quick Actions",
             font=ctk.CTkFont(size=18, weight="bold")
         )
-        actions_label.grid(row=3, column=0, columnspan=4, pady=(30, 15), sticky="w")
+        actions_label.grid(row=3, column=0, columnspan=5, pady=(30, 15), sticky="w")
 
         # Action cards
         actions_frame = ctk.CTkFrame(frame, fg_color="transparent")
-        actions_frame.grid(row=4, column=0, columnspan=4, sticky="ew")
+        actions_frame.grid(row=4, column=0, columnspan=5, sticky="ew")
         actions_frame.grid_columnconfigure((0, 1), weight=1)
 
         action_items = [
-            ("A", "Full Analysis", "Analyze PE headers, sections, imports", self._run_full_analysis),
-            ("B", "Batch Extraction", "Extract features from multiple files", self.show_batch),
+            ("A", "Full Analysis", "Analyze PE headers, sections, imports", self._smart_analyze),
+            ("B", "Batch Extraction", "Extract features from multiple files", self._smart_batch),
         ]
 
         for i, (icon, title, desc, cmd) in enumerate(action_items):
@@ -434,16 +450,14 @@ class PEAnalyzerGUI(ctk.CTk):
         options_frame.pack(fill="x", padx=15, pady=15)
 
         ctk.CTkLabel(options_frame, text="Pattern:").pack(side="left")
-        self.batch_pattern_entry = ctk.CTkEntry(options_frame, width=120, placeholder_text="*.exe")
+        self.batch_pattern_entry = ctk.CTkEntry(options_frame, width=140, placeholder_text="*.exe,*.dll")
         self.batch_pattern_entry.pack(side="left", padx=(5, 20))
-        self.batch_pattern_entry.insert(0, "*.exe")
+        self.batch_pattern_entry.insert(0, "*.exe,*.dll")
 
         ctk.CTkLabel(options_frame, text="Label:").pack(side="left")
         self.batch_label_entry = ctk.CTkEntry(options_frame, width=150, placeholder_text="e.g., malware/benign")
         self.batch_label_entry.pack(side="left", padx=(5, 20))
 
-        self.batch_recursive_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(options_frame, text="Recursive", variable=self.batch_recursive_var).pack(side="left", padx=10)
 
         ctk.CTkButton(
             options_frame, text="Extract Features", width=140,
@@ -574,6 +588,21 @@ class PEAnalyzerGUI(ctk.CTk):
             self.file_label.configure(text=f"{folder_name}/ ({pe_count} PE files)")
             self._log(f"Selected folder: {folder} ({pe_count} PE files)")
 
+    def _smart_analyze(self):
+        """Smart analyze: run if file/folder selected, else go to Analysis tab"""
+        if self.current_file or self.current_folder:
+            self._run_full_analysis()
+        else:
+            self.show_analysis()
+
+    def _smart_batch(self):
+        """Smart batch: run extraction if file/folder selected, else go to Batch tab"""
+        if self.current_file or self.current_folder:
+            self.show_batch()
+            self._run_batch_extraction()
+        else:
+            self.show_batch()
+
     def _run_full_analysis(self):
         """Run full analysis on file or folder"""
         if self.current_folder:
@@ -592,16 +621,20 @@ class PEAnalyzerGUI(ctk.CTk):
             messagebox.showwarning("No Folder", "Please select a folder using 'Open Folder' button first.")
             return
 
-        self._log(f"Scanning folder: {self.current_folder}")
-        threading.Thread(target=self._do_folder_analysis, daemon=True).start()
+        recursive = self.folder_recursive_var.get()
+        self._log(f"Scanning folder: {self.current_folder} (recursive={recursive})")
+        threading.Thread(target=self._do_folder_analysis, args=(recursive,), daemon=True).start()
 
-    def _do_folder_analysis(self):
+    def _do_folder_analysis(self, recursive=False):
         """Perform folder analysis in thread"""
         folder_path = Path(self.current_folder)
         patterns = ["*.exe", "*.dll", "*.sys", "*.ocx", "*.scr"]
         pe_files = []
         for pattern in patterns:
-            pe_files.extend(folder_path.glob(pattern))
+            if recursive:
+                pe_files.extend(folder_path.rglob(pattern))
+            else:
+                pe_files.extend(folder_path.glob(pattern))
 
         if not pe_files:
             self._log("No PE files found in folder")
@@ -654,10 +687,15 @@ class PEAnalyzerGUI(ctk.CTk):
         sections = result.get("sections", {})
         imports = result.get("imports", {})
         indicators = result.get("suspicious_indicators", [])
+        dll_features = result.get("dll_features", {})
 
         self.stat_cards["sections"].set_value(str(sections.get("count", 0)))
         self.stat_cards["imports"].set_value(str(len(imports.get("imports", []))))
         self.stat_cards["suspicious"].set_value(str(len(indicators)))
+
+        # Update exports stat
+        exports_count = dll_features.get("exports", {}).get("count", 0) if dll_features else imports.get("exports", {}).get("count", 0)
+        self.stat_cards["exports"].set_value(str(exports_count))
 
         # Store result for toggle
         self._current_analysis_result = result
@@ -696,6 +734,13 @@ class PEAnalyzerGUI(ctk.CTk):
             self._build_headers_content, headers
         )
 
+        # Security Features Section (for both EXE and DLL)
+        opt_header = headers.get("optional_header", {})
+        row = self._add_collapsible_section(
+            row, "security", "Security Features", "#16A085",
+            self._build_security_content, opt_header
+        )
+
         # Sections Section
         row = self._add_collapsible_section(
             row, "sections", f"Sections ({sections.get('count', 0)})", "#27AE60",
@@ -704,8 +749,9 @@ class PEAnalyzerGUI(ctk.CTk):
 
         # Imports Section
         import_count = len(imports.get("imports", []))
+        func_count = sum(len(imp.get("functions", [])) for imp in imports.get("imports", []))
         row = self._add_collapsible_section(
-            row, "imports", f"Imports ({import_count})", "#F39C12",
+            row, "imports", f"Imports ({import_count} DLLs, {func_count} funcs)", "#F39C12",
             self._build_imports_content, imports
         )
 
@@ -722,6 +768,14 @@ class PEAnalyzerGUI(ctk.CTk):
             row = self._add_collapsible_section(
                 row, "suspicious", f"Suspicious ({len(indicators)})", "#E74C3C",
                 self._build_suspicious_content, indicators
+            )
+
+        # DLL Features Section (if DLL)
+        dll_features = result.get("dll_features", {})
+        if dll_features and dll_features.get("is_dll"):
+            row = self._add_collapsible_section(
+                row, "dll_features", "DLL Analysis", "#8E44AD",
+                self._build_dll_features_content, dll_features
             )
 
     def _add_collapsible_section(self, row: int, section_id: str, title: str, color: str, content_builder, data) -> int:
@@ -768,14 +822,19 @@ class PEAnalyzerGUI(ctk.CTk):
         frame.grid_columnconfigure(1, weight=1)
         sha256 = file_info.get("sha256", "N/A")
         sha256_display = sha256[:40] + "..." if sha256 and len(sha256) > 40 else sha256
+        ssdeep = file_info.get("ssdeep", "")
+        ssdeep_display = ssdeep[:35] + "..." if ssdeep and len(ssdeep) > 35 else ssdeep
         items = [
             ("Filename", file_info.get("filename", "N/A")),
             ("Size", f"{file_info.get('size', 0):,} bytes"),
             ("MD5", file_info.get("md5", "N/A")),
+            ("SHA1", file_info.get("sha1", "N/A")),
             ("SHA256", sha256_display),
-            ("Entropy", f"{file_info.get('entropy', 0):.4f}"),
-            ("Type", file_info.get("file_type", "N/A")),
+            ("Entropy", f"{file_info.get('entropy', 0):.4f} - {file_info.get('entropy_interpretation', '')}"),
+            ("Imphash", file_info.get("imphash", "N/A")),
         ]
+        if ssdeep_display:
+            items.append(("SSDeep", ssdeep_display))
         for i, (label, value) in enumerate(items):
             ctk.CTkLabel(frame, text=label, font=ctk.CTkFont(size=11), text_color=("#3498DB", "#5DADE2")).grid(row=i, column=0, sticky="w", padx=10, pady=3)
             ctk.CTkLabel(frame, text=str(value), font=ctk.CTkFont(size=11, family="Consolas")).grid(row=i, column=1, sticky="w", padx=5, pady=3)
@@ -800,17 +859,91 @@ class PEAnalyzerGUI(ctk.CTk):
         else:
             base_str = f"0x{image_base:X}"
 
+        # Get characteristics list
+        chars = file_hdr.get("Characteristics", [])
+        chars_str = ", ".join(chars[:4]) if isinstance(chars, list) else str(chars)
+        if isinstance(chars, list) and len(chars) > 4:
+            chars_str += f" (+{len(chars)-4})"
+
         items = [
+            ("PE Type", headers.get("pe_type", "Unknown")),
             ("Machine", file_hdr.get("Machine", "N/A")),
             ("Subsystem", opt.get("Subsystem", "N/A")),
             ("Entry Point", entry_str),
             ("Image Base", base_str),
+            ("Linker", f"{opt.get('MajorLinkerVersion', 0)}.{opt.get('MinorLinkerVersion', 0)}"),
             ("Timestamp", file_hdr.get("TimeDateStamp", "N/A")),
             ("Sections", file_hdr.get("NumberOfSections", 0)),
+            ("Checksum", opt.get("CheckSum", "N/A")),
+            ("Flags", chars_str),
         ]
         for i, (label, value) in enumerate(items):
             ctk.CTkLabel(frame, text=label, font=ctk.CTkFont(size=11), text_color=("#9B59B6", "#BB8FCE")).grid(row=i, column=0, sticky="w", padx=10, pady=3)
             ctk.CTkLabel(frame, text=str(value), font=ctk.CTkFont(size=11, family="Consolas")).grid(row=i, column=1, sticky="w", padx=5, pady=3)
+
+    def _build_security_content(self, frame: ctk.CTkFrame, opt_header: Dict):
+        """Build security features content from DllCharacteristics"""
+        frame.grid_columnconfigure(1, weight=1)
+
+        dll_char = opt_header.get("DllCharacteristics", "0x0")
+
+        # Parse hex value
+        try:
+            if isinstance(dll_char, str):
+                char_value = int(dll_char, 16)
+            else:
+                char_value = int(dll_char)
+        except (ValueError, TypeError):
+            char_value = 0
+
+        # Define security features with their flags
+        features = [
+            (0x0040, "ASLR", "Address Space Layout Randomization"),
+            (0x0100, "DEP/NX", "Data Execution Prevention"),
+            (0x4000, "CFG", "Control Flow Guard"),
+            (0x0020, "High Entropy VA", "64-bit ASLR with high entropy"),
+            (0x0080, "Force Integrity", "Code signing required"),
+            (0x0400, "No SEH", "No structured exception handling"),
+        ]
+
+        # Calculate security score
+        score = 0
+        if char_value & 0x0040: score += 25  # ASLR
+        if char_value & 0x0100: score += 25  # DEP
+        if char_value & 0x4000: score += 25  # CFG
+        if char_value & 0x0020: score += 15  # High Entropy
+        if char_value & 0x0080: score += 10  # Force Integrity
+
+        # Score color
+        if score >= 75:
+            score_color = "#27AE60"
+        elif score >= 50:
+            score_color = "#F39C12"
+        else:
+            score_color = "#E74C3C"
+
+        # Security score row
+        ctk.CTkLabel(frame, text="Security Score", font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color=("#16A085", "#1ABC9C")).grid(row=0, column=0, sticky="w", padx=10, pady=3)
+        ctk.CTkLabel(frame, text=f"{score}/100", font=ctk.CTkFont(size=11, family="Consolas", weight="bold"),
+                     text_color=score_color).grid(row=0, column=1, sticky="w", padx=5, pady=3)
+
+        # Feature rows
+        for i, (flag, name, desc) in enumerate(features, start=1):
+            enabled = bool(char_value & flag)
+            status = "✓ Enabled" if enabled else "✗ Disabled"
+            status_color = "#27AE60" if enabled else "#E74C3C"
+
+            # Important features (ASLR, DEP, CFG) show red if disabled
+            if not enabled and flag in [0x0040, 0x0100, 0x4000]:
+                status_color = "#E74C3C"
+            elif not enabled:
+                status_color = ("gray50", "gray60")
+
+            ctk.CTkLabel(frame, text=name, font=ctk.CTkFont(size=10),
+                         text_color=("#16A085", "#1ABC9C")).grid(row=i, column=0, sticky="w", padx=10, pady=2)
+            ctk.CTkLabel(frame, text=status, font=ctk.CTkFont(size=10, family="Consolas"),
+                         text_color=status_color).grid(row=i, column=1, sticky="w", padx=5, pady=2)
 
     def _build_sections_content(self, frame: ctk.CTkFrame, sections: Dict):
         """Build sections content with table"""
@@ -875,6 +1008,75 @@ class PEAnalyzerGUI(ctk.CTk):
         if len(indicators) > 12:
             ctk.CTkLabel(frame, text=f"... and {len(indicators) - 12} more", font=ctk.CTkFont(size=10), text_color=("gray50", "gray60")).pack(anchor="w", padx=10, pady=3)
 
+    def _build_dll_features_content(self, frame: ctk.CTkFrame, dll_features: Dict):
+        """Build DLL features content"""
+        frame.grid_columnconfigure(1, weight=1)
+
+        dll_info = dll_features.get("dll_info", {})
+        dll_type = dll_features.get("dll_type_analysis", {})
+        dll_chars = dll_features.get("dll_characteristics", {})
+        exports = dll_features.get("exports", {})
+        security = dll_chars.get("security_features", {})
+
+        # Security score color
+        security_score = dll_chars.get("security_score", 0)
+        if security_score >= 75:
+            score_color = "#27AE60"
+        elif security_score >= 50:
+            score_color = "#F39C12"
+        else:
+            score_color = "#E74C3C"
+
+        # Risk level color
+        risk_level = dll_info.get("risk_level", "NONE")
+        if risk_level == "HIGH":
+            risk_color = "#E74C3C"
+        elif risk_level == "MEDIUM":
+            risk_color = "#F39C12"
+        else:
+            risk_color = "#27AE60"
+
+        items = [
+            ("DLL Type", dll_type.get("type", "Unknown")),
+            ("Subtypes", ", ".join(dll_type.get("subtypes", [])) or "None"),
+            ("Exports", f"{exports.get('count', 0)} ({exports.get('named_count', 0)} named, {exports.get('ordinal_only_count', 0)} ordinal)"),
+            ("Forwarded", str(len(dll_features.get("forwarded_functions", [])))),
+            ("Security Score", f"{security_score}/100"),
+            ("Risk Level", risk_level),
+        ]
+
+        for i, (label, value) in enumerate(items):
+            label_color = "#8E44AD"
+            value_color = ("gray20", "gray90")
+
+            # Special coloring for security score and risk
+            if label == "Security Score":
+                value_color = score_color
+            elif label == "Risk Level":
+                value_color = risk_color
+
+            ctk.CTkLabel(frame, text=label, font=ctk.CTkFont(size=11), text_color=(label_color, "#BB8FCE")).grid(row=i, column=0, sticky="w", padx=10, pady=3)
+            if isinstance(value_color, str):
+                ctk.CTkLabel(frame, text=str(value), font=ctk.CTkFont(size=11, family="Consolas", weight="bold"), text_color=value_color).grid(row=i, column=1, sticky="w", padx=5, pady=3)
+            else:
+                ctk.CTkLabel(frame, text=str(value), font=ctk.CTkFont(size=11, family="Consolas")).grid(row=i, column=1, sticky="w", padx=5, pady=3)
+
+        # Security features
+        row = len(items)
+        ctk.CTkLabel(frame, text="Security Features:", font=ctk.CTkFont(size=10), text_color=("#8E44AD", "#BB8FCE")).grid(row=row, column=0, sticky="w", padx=10, pady=(8, 3))
+
+        security_text = []
+        if security.get("aslr_enabled"):
+            security_text.append("ASLR")
+        if security.get("dep_enabled"):
+            security_text.append("DEP")
+        if security.get("cfg_enabled"):
+            security_text.append("CFG")
+        if security.get("high_entropy_va"):
+            security_text.append("High Entropy")
+
+        ctk.CTkLabel(frame, text=" | ".join(security_text) if security_text else "None", font=ctk.CTkFont(size=10, family="Consolas")).grid(row=row, column=1, sticky="w", padx=5, pady=(8, 3))
+
     def _build_details_view(self, result: Dict):
         """Build visual detailed view with cards - shows ALL data"""
         for widget in self.analysis_details_frame.winfo_children():
@@ -890,20 +1092,21 @@ class PEAnalyzerGUI(ctk.CTk):
         # ═══════════════════════════════════════════════════════════════
         # FILE INFORMATION CARD
         # ═══════════════════════════════════════════════════════════════
-        self._add_detail_card(
-            "FILE INFORMATION", "#3498DB",
-            [
-                ("Filename", file_info.get("filename", "N/A")),
-                ("Full Path", file_info.get("filepath", "N/A")),
-                ("Size", f"{file_info.get('size', 0):,} bytes"),
-                ("File Type", file_info.get("file_type", "N/A")),
-                ("Entropy", f"{file_info.get('entropy', 0):.6f}"),
-                ("---", ""),
-                ("MD5", file_info.get("md5", "N/A")),
-                ("SHA1", file_info.get("sha1", "N/A")),
-                ("SHA256", file_info.get("sha256", "N/A")),
-            ]
-        )
+        file_items = [
+            ("Filename", file_info.get("filename", "N/A")),
+            ("Full Path", file_info.get("filepath", "N/A")),
+            ("Size", f"{file_info.get('size', 0):,} bytes"),
+            ("Entropy", f"{file_info.get('entropy', 0):.6f} - {file_info.get('entropy_interpretation', '')}"),
+            ("---", ""),
+            ("MD5", file_info.get("md5", "N/A")),
+            ("SHA1", file_info.get("sha1", "N/A")),
+            ("SHA256", file_info.get("sha256", "N/A")),
+            ("Imphash", file_info.get("imphash", "N/A")),
+        ]
+        if file_info.get("ssdeep"):
+            file_items.append(("SSDeep", file_info.get("ssdeep")))
+
+        self._add_detail_card("FILE INFORMATION", "#3498DB", file_items)
 
         # ═══════════════════════════════════════════════════════════════
         # PE HEADERS CARD
@@ -933,6 +1136,38 @@ class PEAnalyzerGUI(ctk.CTk):
 
         if header_items:
             self._add_detail_card("PE HEADERS", "#9B59B6", header_items)
+
+        # ═══════════════════════════════════════════════════════════════
+        # SECURITY FEATURES CARD (for both EXE and DLL)
+        # ═══════════════════════════════════════════════════════════════
+        dll_char = opt.get("DllCharacteristics", "0x0")
+        try:
+            if isinstance(dll_char, str):
+                char_value = int(dll_char, 16)
+            else:
+                char_value = int(dll_char)
+        except (ValueError, TypeError):
+            char_value = 0
+
+        # Calculate security score
+        score = 0
+        if char_value & 0x0040: score += 25  # ASLR
+        if char_value & 0x0100: score += 25  # DEP
+        if char_value & 0x4000: score += 25  # CFG
+        if char_value & 0x0020: score += 15  # High Entropy
+        if char_value & 0x0080: score += 10  # Force Integrity
+
+        security_items = [
+            ("Security Score", f"{score}/100"),
+            ("---", ""),
+            ("ASLR", "✓ Enabled" if char_value & 0x0040 else "✗ Disabled"),
+            ("DEP/NX", "✓ Enabled" if char_value & 0x0100 else "✗ Disabled"),
+            ("CFG", "✓ Enabled" if char_value & 0x4000 else "✗ Disabled"),
+            ("High Entropy VA", "✓ Enabled" if char_value & 0x0020 else "✗ Disabled"),
+            ("Force Integrity", "✓ Enabled" if char_value & 0x0080 else "✗ Disabled"),
+            ("No SEH", "Yes" if char_value & 0x0400 else "No"),
+        ]
+        self._add_detail_card("SECURITY FEATURES", "#16A085", security_items)
 
         # ═══════════════════════════════════════════════════════════════
         # SECTIONS CARD (ALL)
@@ -1087,6 +1322,94 @@ class PEAnalyzerGUI(ctk.CTk):
         if indicators:
             ind_items = [(f"[{i:02d}] {ind}", "") for i, ind in enumerate(indicators, 1)]
             self._add_detail_card(f"SUSPICIOUS INDICATORS ({len(indicators)})", "#E74C3C", ind_items)
+
+        # ═══════════════════════════════════════════════════════════════
+        # DLL FEATURES CARD (if DLL)
+        # ═══════════════════════════════════════════════════════════════
+        dll_features = result.get("dll_features", {})
+        if dll_features and dll_features.get("is_dll"):
+            self._build_dll_details_card(dll_features)
+
+    def _build_dll_details_card(self, dll_features: Dict):
+        """Build detailed DLL features card"""
+        dll_info = dll_features.get("dll_info", {})
+        dll_type = dll_features.get("dll_type_analysis", {})
+        dll_chars = dll_features.get("dll_characteristics", {})
+        exports = dll_features.get("exports", {})
+        forwarded = dll_features.get("forwarded_functions", [])
+        indicators = dll_features.get("suspicious_indicators", [])
+        security = dll_chars.get("security_features", {})
+
+        # DLL Info Card
+        dll_items = [
+            ("[ GENERAL ]", ""),
+            ("  DLL Type", dll_type.get("type", "Unknown")),
+            ("  Subtypes", ", ".join(dll_type.get("subtypes", [])) or "None"),
+            ("  Risk Level", dll_info.get("risk_level", "NONE")),
+            ("  Risk Score", f"{dll_info.get('risk_score', 0)}/100"),
+            ("---", ""),
+            ("[ SECURITY ]", ""),
+            ("  Security Score", f"{dll_chars.get('security_score', 0)}/100"),
+            ("  ASLR", "Enabled" if security.get("aslr_enabled") else "Disabled"),
+            ("  DEP", "Enabled" if security.get("dep_enabled") else "Disabled"),
+            ("  CFG", "Enabled" if security.get("cfg_enabled") else "Disabled"),
+            ("  High Entropy VA", "Enabled" if security.get("high_entropy_va") else "Disabled"),
+            ("  Force Integrity", "Enabled" if security.get("force_integrity") else "Disabled"),
+            ("  No SEH", "Yes" if security.get("no_seh") else "No"),
+            ("---", ""),
+            ("[ EXPORTS ]", ""),
+            ("  Total Count", str(exports.get("count", 0))),
+            ("  Named Exports", str(exports.get("named_count", 0))),
+            ("  Ordinal-Only", str(exports.get("ordinal_only_count", 0))),
+            ("  Forwarded", str(len(forwarded))),
+        ]
+
+        # Add export categories
+        categories = exports.get("categories", {})
+        if categories:
+            dll_items.append(("---", ""))
+            dll_items.append(("[ EXPORT CATEGORIES ]", ""))
+            for cat, funcs in categories.items():
+                if funcs:
+                    dll_items.append((f"  {cat.replace('_', ' ').title()}", str(len(funcs))))
+
+        self._add_detail_card("DLL ANALYSIS", "#8E44AD", dll_items)
+
+        # DLL Exports Card (show first 30)
+        export_funcs = exports.get("functions", [])
+        if export_funcs:
+            export_items = []
+            for i, exp in enumerate(export_funcs[:30]):
+                name = exp.get("name") or f"Ordinal_{exp.get('ordinal', '?')}"
+                addr = exp.get("address", "")
+                is_fwd = exp.get("is_forwarded", False)
+                forwarder = exp.get("forwarder", "")
+
+                if is_fwd:
+                    export_items.append((f"  {name}", f"-> {forwarder}", "#F39C12"))
+                else:
+                    export_items.append((f"  {name}", addr))
+
+            if len(export_funcs) > 30:
+                export_items.append(("---", ""))
+                export_items.append((f"  ... and {len(export_funcs) - 30} more exports", ""))
+
+            self._add_detail_card(f"DLL EXPORTS ({len(export_funcs)})", "#9B59B6", export_items)
+
+        # DLL Suspicious Indicators
+        if indicators:
+            sus_items = []
+            for ind in indicators:
+                severity = ind.get("severity", "info").upper()
+                desc = ind.get("description", "")
+                if severity == "HIGH":
+                    sus_items.append((f"[{severity}] {desc}", "", "#E74C3C"))
+                elif severity == "MEDIUM":
+                    sus_items.append((f"[{severity}] {desc}", "", "#F39C12"))
+                else:
+                    sus_items.append((f"[{severity}] {desc}", ""))
+
+            self._add_detail_card(f"DLL SUSPICIOUS ({len(indicators)})", "#E74C3C", sus_items)
 
     def _add_detail_card(self, title: str, color: str, items: list):
         """Add a detailed card to the details panel"""
@@ -1425,8 +1748,8 @@ class PEAnalyzerGUI(ctk.CTk):
 
     def _do_batch_folder_extraction(self):
         """Extract features from folder"""
-        pattern = self.batch_pattern_entry.get() or "*.exe"
-        recursive = self.batch_recursive_var.get()
+        pattern_input = self.batch_pattern_entry.get() or "*.exe,*.dll"
+        recursive = self.recursive_var.get()
         label = self.batch_label_entry.get().strip()
 
         try:
@@ -1435,7 +1758,18 @@ class PEAnalyzerGUI(ctk.CTk):
             self.after(0, self._clear_batch_results)
 
             folder_path = Path(self.current_folder)
-            files = list(folder_path.rglob(pattern) if recursive else folder_path.glob(pattern))
+
+            # Support multiple patterns separated by comma
+            patterns = [p.strip() for p in pattern_input.split(",") if p.strip()]
+            files = []
+            for pattern in patterns:
+                if recursive:
+                    files.extend(folder_path.rglob(pattern))
+                else:
+                    files.extend(folder_path.glob(pattern))
+
+            # Remove duplicates while preserving order
+            files = list(dict.fromkeys(files))
 
             if not files:
                 self._log("No files found")

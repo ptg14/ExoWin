@@ -1,10 +1,11 @@
 """
-CLI interface for ExoWin
+CLI interface for ExoWin - Simplified version
 """
 from pathlib import Path
 from typing import Optional
 import typer
 from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
 
 from exowin.analyzer import ExoWinAnalyzer
 from exowin.reporters import (
@@ -18,7 +19,7 @@ from exowin.extractors import MLFeaturesExtractor
 
 app = typer.Typer(
     name="exowin",
-    help="ExoWin - CLI tool for static analysis and feature extraction from PE files",
+    help="ExoWin - Static analysis and feature extraction for PE files (EXE/DLL)",
     add_completion=False,
 )
 
@@ -30,12 +31,76 @@ reporters = {
     "json": JSONReporter(),
     "html": HTMLReporter(),
     "markdown": MarkdownReporter(),
+    "md": MarkdownReporter(),
     "console": ConsoleReporter(),
     "csv": CSVReporter(),
 }
 
 # ML Feature extractor
 ml_extractor = MLFeaturesExtractor()
+
+
+def _detect_pe_type(pe) -> str:
+    """Detect PE type (EXE or DLL)"""
+    return "DLL" if pe.is_dll() else "EXE"
+
+
+def _get_pe_files(path: Path, recursive: bool = False) -> list:
+    """Get all PE files from path (file or directory)"""
+    # Resolve to absolute path
+    path = path.resolve()
+
+    if path.is_file():
+        return [path]
+    elif path.is_dir():
+        patterns = ["*.exe", "*.dll", "*.EXE", "*.DLL"]
+        files = []
+        for pattern in patterns:
+            if recursive:
+                files.extend(path.rglob(pattern))
+            else:
+                files.extend(path.glob(pattern))
+        return list(set(files))  # Remove duplicates
+    return []
+
+
+def _analyze_single_file(filepath: Path, include_disasm: bool = False) -> dict:
+    """Analyze a single PE file with auto DLL detection"""
+    import pefile
+    from exowin.extractors import DLLFeaturesExtractor
+
+    result = analyzer.analyze_file(str(filepath), include_disasm=include_disasm)
+
+    # Auto-detect and add DLL features
+    try:
+        pe = pefile.PE(str(filepath))
+        if pe.is_dll():
+            dll_extractor = DLLFeaturesExtractor()
+            result["dll_features"] = dll_extractor.extract(pe, str(filepath))
+        pe.close()
+    except Exception:
+        pass
+
+    return result
+
+
+def _extract_features_single(filepath: Path, label: Optional[str] = None) -> dict:
+    """Extract ML features from a single PE file (unified EXE/DLL extraction)"""
+    import pefile
+
+    pe = pefile.PE(str(filepath))
+    # Base extractor already includes all features (EXE + DLL)
+    features = ml_extractor.extract(pe, str(filepath))
+
+    # Add metadata
+    is_dll = pe.is_dll()
+    features["filename"] = filepath.name
+    features["pe_type"] = "DLL" if is_dll else "EXE"
+    if label:
+        features["label"] = label
+
+    pe.close()
+    return features
 
 
 @app.command()
@@ -49,286 +114,137 @@ def gui():
         gui_main()
     except ImportError as e:
         console.print(f"[red]Error launching GUI: {e}[/red]")
-        console.print("[yellow]Make sure tkinter is installed[/yellow]")
+        console.print("[yellow]Make sure customtkinter is installed[/yellow]")
         raise typer.Exit(1)
 
 
 @app.command()
 def analyze(
-    filepath: Path = typer.Argument(..., help="Path to PE file to analyze"),
-    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Output file path"),
+    path: Path = typer.Argument(..., help="Path to PE file or directory"),
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Output file/directory path"),
     format: str = typer.Option("console", "--format", "-f", help="Output format: console, json, html, markdown"),
-    disasm: bool = typer.Option(False, "--disasm", "-d", help="Include disassembly"),
-    num_instructions: int = typer.Option(40, "--num-instructions", "-n", help="Number of instructions to disassemble"),
+    recursive: bool = typer.Option(False, "--recursive", "-r", help="Search subdirectories"),
+    disasm: bool = typer.Option(False, "--disasm", "-d", help="Scan for suspicious disassembly patterns"),
 ):
     """
-    Analyze PE file and generate full report
+    Analyze PE file(s) - auto-detects file/folder, EXE/DLL
     """
     try:
-        console.print(f"[blue]Analyzing file: {filepath}[/blue]")
-
-        # Analyze file
-        result = analyzer.analyze_file(
-            str(filepath),
-            include_disasm=disasm,
-            num_instructions=num_instructions
-        )
-
-        # Generate report
-        if format not in reporters:
-            console.print(f"[red]Invalid format: {format}[/red]")
-            console.print(f"[yellow]Valid formats: {', '.join(reporters.keys())}[/yellow]")
-            raise typer.Exit(1)
-
-        reporter = reporters[format]
-        output_str = str(output) if output else None
-        reporter.generate(result, output_str)
-
-        if output:
-            console.print(f"[green]Report saved: {output}[/green]")
-
-    except FileNotFoundError as e:
-        console.print(f"[red]Error: {e}[/red]")
-        raise typer.Exit(1)
-    except ValueError as e:
-        console.print(f"[red]Error: {e}[/red]")
-        raise typer.Exit(1)
-    except Exception as e:
-        console.print(f"[red]Unexpected error: {e}[/red]")
-        raise typer.Exit(1)
-
-
-@app.command()
-def info(
-    filepath: Path = typer.Argument(..., help="Path to PE file"),
-):
-    """
-    Display basic information about PE file
-    """
-    try:
-        console.print(f"[blue]Getting file info: {filepath}[/blue]")
-
-        result = analyzer.quick_info(str(filepath))
-
-        # Display using console reporter
-        console_reporter = ConsoleReporter()
-        console_reporter._print_file_info(result["file_info"])
-
-        console.print(f"[bold]Type:[/bold] {result['pe_type']}")
-        console.print(f"[bold]Machine:[/bold] {result['machine']}")
-        console.print(f"[bold]Subsystem:[/bold] {result['subsystem']}")
-
-    except Exception as e:
-        console.print(f"[red]Error: {e}[/red]")
-        raise typer.Exit(1)
-
-
-@app.command()
-def sections(
-    filepath: Path = typer.Argument(..., help="Path to PE file"),
-):
-    """
-    Display sections information from PE file
-    """
-    try:
-        import pefile
-
-        console.print(f"[blue]Analyzing sections: {filepath}[/blue]")
-
-        pe = pefile.PE(str(filepath))
-        sections_extractor = analyzer.extractors["sections"]
-        sections_data = sections_extractor.extract(pe, str(filepath))
-
-        # Display using console reporter
-        console_reporter = ConsoleReporter()
-        console_reporter._print_sections(sections_data)
-
-        pe.close()
-
-    except Exception as e:
-        console.print(f"[red]Error: {e}[/red]")
-        raise typer.Exit(1)
-
-
-@app.command()
-def imports(
-    filepath: Path = typer.Argument(..., help="Path to PE file"),
-    show_all: bool = typer.Option(False, "--all", "-a", help="Show all imports"),
-):
-    """
-    Display imports and detect suspicious APIs
-    """
-    try:
-        import pefile
-
-        console.print(f"[blue]Analyzing imports: {filepath}[/blue]")
-
-        pe = pefile.PE(str(filepath))
-        imports_extractor = analyzer.extractors["imports"]
-        imports_data = imports_extractor.extract(pe, str(filepath))
-
-        # Display suspicious APIs
-        suspicious_apis = imports_data.get("suspicious_apis", {})
-        if suspicious_apis:
-            console_reporter = ConsoleReporter()
-            console_reporter._print_suspicious_apis(suspicious_apis)
-        else:
-            console.print("[green]No suspicious APIs detected[/green]")
-
-        # Display all imports if requested
-        if show_all:
-            from rich.table import Table
-
-            table = Table(title="All Imports")
-            table.add_column("DLL", style="cyan")
-            table.add_column("Functions", justify="right")
-
-            for dll_import in imports_data.get("imports", []):
-                table.add_row(
-                    dll_import["dll"],
-                    str(dll_import["function_count"])
-                )
-
-            console.print(table)
-
-        pe.close()
-
-    except Exception as e:
-        console.print(f"[red]Error: {e}[/red]")
-        raise typer.Exit(1)
-
-
-@app.command()
-def strings(
-    filepath: Path = typer.Argument(..., help="Path to PE file"),
-):
-    """
-    Extract and categorize strings from PE file
-    """
-    try:
-        import pefile
-
-        console.print(f"[blue]Extracting strings: {filepath}[/blue]")
-
-        pe = pefile.PE(str(filepath))
-        strings_extractor = analyzer.extractors["strings"]
-        strings_data = strings_extractor.extract(pe, str(filepath))
-
-        # Display using console reporter
-        console_reporter = ConsoleReporter()
-        console_reporter._print_strings(strings_data)
-
-        console.print(f"[bold]Total strings:[/bold] {strings_data.get('total_count', 0)}")
-
-        pe.close()
-
-    except Exception as e:
-        console.print(f"[red]Error: {e}[/red]")
-        raise typer.Exit(1)
-
-
-@app.command()
-def disasm(
-    filepath: Path = typer.Argument(..., help="Path to PE file"),
-    num_instructions: int = typer.Option(40, "--num", "-n", help="Number of instructions"),
-):
-    """
-    Disassemble code from entry point
-    """
-    try:
-        import pefile
-
-        console.print(f"[blue]Disassembling: {filepath}[/blue]")
-
-        pe = pefile.PE(str(filepath))
-        disasm_extractor = analyzer.extractors["disasm"]
-        disasm_data = disasm_extractor.extract(pe, str(filepath), num_instructions)
-
-        if "error" in disasm_data:
-            console.print(f"[red]{disasm_data['error']}[/red]")
-        else:
-            from rich.table import Table
-
-            table = Table(title=f"Disassembly from {disasm_data['entry_point']}")
-            table.add_column("Address", style="cyan")
-            table.add_column("Mnemonic", style="yellow")
-            table.add_column("Operands", style="green")
-            table.add_column("Bytes", style="dim")
-
-            for insn in disasm_data["instructions"]:
-                table.add_row(
-                    insn["address"],
-                    insn["mnemonic"],
-                    insn["operands"],
-                    insn["bytes"]
-                )
-
-            console.print(table)
-
-        pe.close()
-
-    except Exception as e:
-        console.print(f"[red]Error: {e}[/red]")
-        raise typer.Exit(1)
-
-
-@app.command()
-def batch(
-    input_dir: Path = typer.Argument(..., help="Directory containing PE files"),
-    output_dir: Path = typer.Argument(..., help="Output directory for reports"),
-    format: str = typer.Option("json", "--format", "-f", help="Output format: json, html, markdown"),
-    pattern: str = typer.Option("*.exe", "--pattern", "-p", help="File pattern to search"),
-):
-    """
-    Batch analyze multiple PE files in directory
-    """
-    try:
-        if not input_dir.exists():
-            console.print(f"[red]Directory not found: {input_dir}[/red]")
-            raise typer.Exit(1)
-
-        # Create output directory
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        # Find all PE files
-        files = list(input_dir.glob(pattern))
+        files = _get_pe_files(path, recursive)
 
         if not files:
-            console.print(f"[yellow]No files found with pattern: {pattern}[/yellow]")
-            raise typer.Exit(0)
+            console.print(f"[red]No PE files found: {path}[/red]")
+            raise typer.Exit(1)
 
-        console.print(f"[blue]Found {len(files)} files[/blue]")
+        # Single file
+        if len(files) == 1:
+            filepath = files[0]
+            console.print(f"[blue]Analyzing: {filepath.name}[/blue]")
 
-        # Analyze each file
-        success_count = 0
-        failed_count = 0
+            result = _analyze_single_file(filepath, include_disasm=disasm)
 
-        for file in files:
-            try:
-                console.print(f"[cyan]Analyzing: {file.name}[/cyan]")
+            # Detect type
+            pe_type = result.get("headers", {}).get("pe_type", "PE")
+            if "dll_features" in result:
+                pe_type = "DLL"
+            console.print(f"[cyan]Detected: {pe_type}[/cyan]")
 
-                result = analyzer.analyze_file(str(file))
+            # Generate report
+            # Auto-detect format from output file extension, or append extension from format
+            actual_format = format
+            output_file = output
 
-                # Generate report
-                output_filename = file.stem + f"_report.{format}"
-                output_path = output_dir / output_filename
+            if output:
+                ext = output.suffix.lower().lstrip('.')
+                if ext in ["json", "html", "md", "markdown", "csv"]:
+                    # Extension provided - auto-detect format if format is console
+                    if format == "console":
+                        actual_format = ext
+                else:
+                    # No extension - append extension from format
+                    if format != "console":
+                        ext_map = {"json": ".json", "html": ".html", "markdown": ".md", "md": ".md", "csv": ".csv"}
+                        if format in ext_map:
+                            output_file = Path(str(output) + ext_map[format])
 
-                reporter = reporters.get(format, JSONReporter())
-                reporter.generate(result, str(output_path))
+            reporter = reporters.get(actual_format, ConsoleReporter())
+            if output_file:
+                output_path = str(output_file.resolve())
+            else:
+                output_path = None
+            reporter.generate(result, output_path)
 
-                success_count += 1
-                console.print(f"[green]Saved: {output_path}[/green]")
+            if output_file:
+                console.print(f"[green]Report saved: {output_file}[/green]")
 
-            except Exception as e:
-                failed_count += 1
-                console.print(f"[red]Error analyzing {file.name}: {e}[/red]")
+        # Multiple files (directory)
+        else:
 
-        console.print(f"\n[bold]Results:[/bold]")
-        console.print(f"[green]Success: {success_count}[/green]")
-        console.print(f"[red]Failed: {failed_count}[/red]")
+            console.print(f"[blue]Found {len(files)} PE files[/blue]")
+
+            # Create output directory if needed
+            if output:
+                output.mkdir(parents=True, exist_ok=True)
+
+            success_count = 0
+            failed_count = 0
+            dll_count = 0
+            exe_count = 0
+
+            root_dir = path.resolve()
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+                console=console
+            ) as progress:
+                task = progress.add_task("Analyzing...", total=len(files))
+
+                for filepath in files:
+                    try:
+                        result = _analyze_single_file(filepath, include_disasm=disasm)
+
+                        # Count types
+                        if "dll_features" in result:
+                            dll_count += 1
+                        else:
+                            exe_count += 1
+
+                        # Save report
+                        if output:
+                            ext = "md" if format == "markdown" else format
+                            # Tạo tên file report có thêm tên thư mục nếu là file trong subfolder
+                            rel_path = filepath.relative_to(root_dir)
+                            rel_parts = rel_path.parts[:-1]  # các thư mục cha
+                            if rel_parts:
+                                prefix = "_".join(rel_parts) + "_"
+                            else:
+                                prefix = ""
+                            report_name = prefix + filepath.stem + f".{ext}"
+                            report_path = output / report_name
+                            reporter = reporters.get(format, JSONReporter())
+                            reporter.generate(result, str(report_path))
+
+                        success_count += 1
+
+                    except Exception as e:
+                        failed_count += 1
+                        console.print(f"[red]Error: {filepath.name} - {e}[/red]")
+
+                    progress.update(task, advance=1)
+
+            console.print(f"\n[bold]Results:[/bold]")
+            console.print(f"[green]Success: {success_count}[/green] (EXE: {exe_count}, DLL: {dll_count})")
+            console.print(f"[red]Failed: {failed_count}[/red]")
+            if output:
+                console.print(f"[blue]Reports saved to: {output}[/blue]")
 
     except Exception as e:
         console.print(f"[red]Error: {e}[/red]")
+        import traceback
+        traceback.print_exc()
         raise typer.Exit(1)
 
 
@@ -341,65 +257,64 @@ def compare(
     Compare two PE files
     """
     try:
+        from rich.table import Table
+
         console.print(f"[blue]Comparing {file1.name} and {file2.name}[/blue]\n")
 
         # Analyze both files
-        result1 = analyzer.analyze_file(str(file1))
-        result2 = analyzer.analyze_file(str(file2))
+        result1 = _analyze_single_file(file1)
+        result2 = _analyze_single_file(file2)
 
         # Compare file info
-        from rich.table import Table
-
         table = Table(title="File Information Comparison")
         table.add_column("Property", style="cyan")
-        table.add_column(file1.name, style="yellow")
-        table.add_column(file2.name, style="green")
+        table.add_column(file1.name[:30], style="yellow")
+        table.add_column(file2.name[:30], style="green")
 
-        file_info_keys = ["size", "md5", "sha256", "entropy", "imphash"]
-        for key in file_info_keys:
-            val1 = result1["file_info"].get(key, "N/A")
-            val2 = result2["file_info"].get(key, "N/A")
+        info1 = result1.get("file_info", {})
+        info2 = result2.get("file_info", {})
 
-            # Highlight if different
-            style1 = "red" if val1 != val2 else ""
-            style2 = "red" if val1 != val2 else ""
-
-            table.add_row(
-                key.upper(),
-                f"[{style1}]{val1}[/{style1}]" if style1 else str(val1),
-                f"[{style2}]{val2}[/{style2}]" if style2 else str(val2)
-            )
+        for prop in ["size", "md5", "entropy", "imphash"]:
+            v1 = info1.get(prop, "N/A")
+            v2 = info2.get(prop, "N/A")
+            if isinstance(v1, float):
+                v1 = f"{v1:.4f}"
+            if isinstance(v2, float):
+                v2 = f"{v2:.4f}"
+            match = "✓" if v1 == v2 else "✗"
+            table.add_row(f"{prop} {match}", str(v1), str(v2))
 
         console.print(table)
+
+        # Compare PE type
+        type1 = "DLL" if "dll_features" in result1 else "EXE"
+        type2 = "DLL" if "dll_features" in result2 else "EXE"
+        console.print(f"\n[bold]PE Types:[/bold] {file1.name}: {type1}, {file2.name}: {type2}")
 
         # Compare sections
-        sections1 = {s["Name"]: s for s in result1["sections"]["sections"]}
-        sections2 = {s["Name"]: s for s in result2["sections"]["sections"]}
+        console.print("\n")
+        sections_table = Table(title="Sections Comparison")
+        sections_table.add_column("Section", style="cyan")
+        sections_table.add_column(f"{file1.name[:20]} Entropy", style="yellow")
+        sections_table.add_column(f"{file2.name[:20]} Entropy", style="green")
+        sections_table.add_column("Status", style="magenta")
 
-        all_sections = set(sections1.keys()) | set(sections2.keys())
+        s1_dict = {s["Name"]: s for s in result1.get("sections", {}).get("sections", [])}
+        s2_dict = {s["Name"]: s for s in result2.get("sections", {}).get("sections", [])}
+        all_sections = set(s1_dict.keys()) | set(s2_dict.keys())
 
-        table = Table(title="Sections Comparison")
-        table.add_column("Section", style="cyan")
-        table.add_column(f"{file1.name} Entropy", justify="right")
-        table.add_column(f"{file2.name} Entropy", justify="right")
-        table.add_column("Status", style="yellow")
-
-        for section_name in sorted(all_sections):
-            s1 = sections1.get(section_name)
-            s2 = sections2.get(section_name)
-
-            if s1 and s2:
-                entropy1 = s1["Entropy"]
-                entropy2 = s2["Entropy"]
-                diff = abs(entropy1 - entropy2)
-                status = "Similar" if diff < 0.5 else "Different"
-                table.add_row(section_name, str(entropy1), str(entropy2), status)
-            elif s1:
-                table.add_row(section_name, str(s1["Entropy"]), "N/A", "Only in file1")
+        for section in sorted(all_sections):
+            e1 = f"{s1_dict[section]['Entropy']:.2f}" if section in s1_dict else "-"
+            e2 = f"{s2_dict[section]['Entropy']:.2f}" if section in s2_dict else "-"
+            if section in s1_dict and section in s2_dict:
+                status = "Both"
+            elif section in s1_dict:
+                status = f"Only {file1.name[:15]}"
             else:
-                table.add_row(section_name, "N/A", str(s2["Entropy"]), "Only in file2")
+                status = f"Only {file2.name[:15]}"
+            sections_table.add_row(section, e1, e2, status)
 
-        console.print(table)
+        console.print(sections_table)
 
         # Compare suspicious indicators
         ind1 = set(result1.get("suspicious_indicators", []))
@@ -411,20 +326,17 @@ def compare(
 
         if common or only1 or only2:
             console.print("\n[bold]Suspicious Indicators:[/bold]")
-
             if common:
                 console.print(f"[yellow]Common ({len(common)}):[/yellow]")
-                for ind in common:
+                for ind in list(common)[:5]:
                     console.print(f"  - {ind}")
-
             if only1:
                 console.print(f"\n[red]Only in {file1.name} ({len(only1)}):[/red]")
-                for ind in only1:
+                for ind in list(only1)[:5]:
                     console.print(f"  - {ind}")
-
             if only2:
                 console.print(f"\n[green]Only in {file2.name} ({len(only2)}):[/green]")
-                for ind in only2:
+                for ind in list(only2)[:5]:
                     console.print(f"  - {ind}")
 
     except Exception as e:
@@ -432,148 +344,107 @@ def compare(
         raise typer.Exit(1)
 
 
-@app.command()
+@app.command(name="extract-features")
 def extract_features(
-    filepath: Path = typer.Argument(..., help="Path to PE file"),
-    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Output CSV file path"),
-    label: Optional[str] = typer.Option(None, "--label", "-l", help="Label for the sample (e.g., 'malware', 'benign')"),
-    append: bool = typer.Option(False, "--append", "-a", help="Append to existing CSV file"),
-):
-    """
-    Extract ML features from PE file and save to CSV
-    """
-    try:
-        import pefile
-
-        console.print(f"[blue]Extracting ML features: {filepath}[/blue]")
-
-        pe = pefile.PE(str(filepath))
-        features = ml_extractor.extract(pe, str(filepath))
-
-        # Add metadata
-        features["filename"] = filepath.name
-        if label:
-            features["label"] = label
-
-        pe.close()
-
-        # Output
-        if output:
-            csv_reporter = CSVReporter()
-            if append and output.exists():
-                csv_reporter.append_to_file(features, str(output), write_header=False)
-                console.print(f"[green]Features appended to: {output}[/green]")
-            else:
-                csv_reporter.generate(features, str(output))
-                console.print(f"[green]Features saved to: {output}[/green]")
-        else:
-            # Display features in console
-            from rich.table import Table
-
-            table = Table(title="ML Features")
-            table.add_column("Feature", style="cyan")
-            table.add_column("Value", style="green")
-
-            for key, value in features.items():
-                table.add_row(str(key), str(value))
-
-            console.print(table)
-
-        console.print(f"[bold]Total features:[/bold] {len(features)}")
-
-    except Exception as e:
-        console.print(f"[red]Error: {e}[/red]")
-        raise typer.Exit(1)
-
-
-@app.command()
-def batch_extract(
-    input_dir: Path = typer.Argument(..., help="Directory containing PE files"),
+    path: Path = typer.Argument(..., help="Path to PE file or directory"),
     output: Path = typer.Argument(..., help="Output CSV file path"),
-    pattern: str = typer.Option("*.exe", "--pattern", "-p", help="File pattern to search"),
-    label: Optional[str] = typer.Option(None, "--label", "-l", help="Label for all samples"),
-    recursive: bool = typer.Option(False, "--recursive", "-r", help="Search recursively"),
+    label: Optional[str] = typer.Option(None, "--label", "-l", help="Label for samples"),
+    recursive: bool = typer.Option(False, "--recursive", "-r", help="Search subdirectories"),
+    append: bool = typer.Option(False, "--append", "-a", help="Append to existing CSV"),
 ):
     """
-    Batch extract ML features from multiple PE files to single CSV
+    Extract ML features from PE file(s) - auto-detects file/folder, EXE/DLL
     """
     try:
-        import pefile
-
-        if not input_dir.exists():
-            console.print(f"[red]Directory not found: {input_dir}[/red]")
-            raise typer.Exit(1)
-
-        # Find all PE files
-        if recursive:
-            files = list(input_dir.rglob(pattern))
-        else:
-            files = list(input_dir.glob(pattern))
+        files = _get_pe_files(path, recursive)
 
         if not files:
-            console.print(f"[yellow]No files found with pattern: {pattern}[/yellow]")
-            raise typer.Exit(0)
+            console.print(f"[red]No PE files found: {path}[/red]")
+            raise typer.Exit(1)
 
-        console.print(f"[blue]Found {len(files)} files[/blue]")
+        console.print(f"[blue]Found {len(files)} PE file(s)[/blue]")
 
-        # Extract features from each file
         all_features = []
         success_count = 0
         failed_count = 0
+        dll_count = 0
+        exe_count = 0
 
-        for file in files:
-            try:
-                console.print(f"[cyan]Processing: {file.name}[/cyan]")
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            console=console
+        ) as progress:
+            task = progress.add_task("Extracting features...", total=len(files))
 
-                pe = pefile.PE(str(file))
-                features = ml_extractor.extract(pe, str(file))
+            for filepath in files:
+                try:
+                    features = _extract_features_single(filepath, label)
 
-                # Add metadata
-                features["filename"] = file.name
-                features["filepath"] = str(file)
-                if label:
-                    features["label"] = label
+                    if features.get("pe_type") == "DLL":
+                        dll_count += 1
+                    else:
+                        exe_count += 1
 
-                pe.close()
+                    all_features.append(features)
+                    success_count += 1
 
-                all_features.append(features)
-                success_count += 1
+                except Exception as e:
+                    failed_count += 1
+                    console.print(f"[red]Error: {filepath.name} - {e}[/red]")
 
-            except Exception as e:
-                failed_count += 1
-                console.print(f"[red]Error processing {file.name}: {e}[/red]")
+                progress.update(task, advance=1)
 
-        # Save all features to CSV
+
+        # Đảm bảo output có đuôi .csv
+        output_path = output
+        if output_path.suffix.lower() != ".csv":
+            output_path = output_path.with_suffix(output_path.suffix + ".csv") if output_path.suffix else output_path.with_suffix(".csv")
+
+        # Save to CSV
         if all_features:
-            CSVReporter.generate_batch(all_features, str(output))
-            console.print(f"\n[green]Features saved to: {output}[/green]")
+            if append and output_path.exists():
+                import csv
+                with open(output_path, "a", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=all_features[0].keys())
+                    for features in all_features:
+                        writer.writerow(features)
+                console.print(f"[green]Features appended to: {output_path}[/green]")
+            else:
+                CSVReporter.generate_batch(all_features, str(output_path))
+                console.print(f"[green]Features saved to: {output_path}[/green]")
 
         console.print(f"\n[bold]Results:[/bold]")
-        console.print(f"[green]Success: {success_count}[/green]")
+        console.print(f"[green]Success: {success_count}[/green] (EXE: {exe_count}, DLL: {dll_count})")
         console.print(f"[red]Failed: {failed_count}[/red]")
-        console.print(f"[bold]Total features per sample:[/bold] {len(all_features[0]) if all_features else 0}")
+        console.print(f"[bold]Features per sample:[/bold] {len(all_features[0]) if all_features else 0}")
 
     except Exception as e:
         console.print(f"[red]Error: {e}[/red]")
+        import traceback
+        traceback.print_exc()
         raise typer.Exit(1)
 
 
-@app.command()
+@app.command(name="list-features")
 def list_features():
     """
-    List all available ML features
+    List all available ML features (unified for EXE and DLL)
     """
-    feature_names = ml_extractor.get_feature_names()
-
     from rich.table import Table
 
-    table = Table(title="Available ML Features")
+    # All features from base extractor (already includes DLL features)
+    all_features = ml_extractor.get_feature_names()
+
+    table = Table(title="Available ML Features (Unified EXE/DLL)")
     table.add_column("#", style="dim", justify="right")
     table.add_column("Feature Name", style="cyan")
     table.add_column("Category", style="yellow")
 
-    for i, name in enumerate(feature_names, 1):
-        # Determine category based on prefix
+    for i, name in enumerate(all_features, 1):
+        # Determine category
         if name.startswith("file_"):
             category = "File"
         elif name.startswith("dos_"):
@@ -594,13 +465,15 @@ def list_features():
             category = "Data Directory"
         elif name.startswith("is_"):
             category = "PE Type"
+        elif name.startswith("dll_"):
+            category = "[magenta]DLL-Specific[/magenta]"
         else:
             category = "Other"
-
         table.add_row(str(i), name, category)
 
     console.print(table)
-    console.print(f"\n[bold]Total features:[/bold] {len(feature_names)}")
+    console.print(f"\n[bold]Total features:[/bold] {len(all_features)}")
+    console.print("[dim]Note: DLL features (dll_*) are extracted for all PE files. For EXE files, these values will be 0.[/dim]")
 
 
 @app.command()
@@ -610,7 +483,13 @@ def version():
     """
     from exowin import __version__
     console.print(f"[bold blue]ExoWin v{__version__}[/bold blue]")
-    console.print("ExoWin - Static analysis tool for PE files")
+    console.print("Static analysis and feature extraction for PE files (EXE/DLL)")
+    console.print("\n[dim]Commands: gui, analyze, compare, extract-features, list-features[/dim]")
+
+
+def main():
+    app()
+
 
 if __name__ == "__main__":
-    app()
+    main()

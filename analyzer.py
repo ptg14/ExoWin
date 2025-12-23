@@ -12,6 +12,7 @@ from exowin.extractors import (
     ImportsExtractor,
     StringsExtractor,
     DisasmExtractor,
+    DLLFeaturesExtractor,
 )
 
 
@@ -26,17 +27,16 @@ class ExoWinAnalyzer:
             "imports": ImportsExtractor(),
             "strings": StringsExtractor(),
             "disasm": DisasmExtractor(),
+            "dll_features": DLLFeaturesExtractor(),
         }
 
-    def analyze_file(self, filepath: str, include_disasm: bool = False,
-                     num_instructions: int = 40) -> Dict[str, Any]:
+    def analyze_file(self, filepath: str, include_disasm: bool = False) -> Dict[str, Any]:
         """
         Analyze a PE file and extract all features
 
         Args:
             filepath: Path to PE file
-            include_disasm: Whether to include disassembly
-            num_instructions: Number of instructions to disassemble
+            include_disasm: Whether to include disassembly (scans all executable sections)
 
         Returns:
             Dictionary with all extracted features
@@ -61,9 +61,13 @@ class ExoWinAnalyzer:
             "strings": self.extractors["strings"].extract_safe(pe, str(filepath)),
         }
 
-        # Optionally include disassembly
+        # Extract DLL-specific features if file is a DLL
+        if pe.is_dll():
+            results["dll_features"] = self.extractors["dll_features"].extract_safe(pe, str(filepath))
+
+        # Optionally include disassembly (scans all executable sections for suspicious patterns)
         if include_disasm:
-            results["disasm"] = self.extractors["disasm"].extract(pe, str(filepath), num_instructions)
+            results["disasm"] = self.extractors["disasm"].extract(pe, str(filepath))
 
         # Add suspicious indicators summary
         results["suspicious_indicators"] = self._analyze_suspicious_indicators(results)
@@ -115,6 +119,27 @@ class ExoWinAnalyzer:
         warnings = headers.get("warnings", [])
         if warnings:
             indicators.append(f"PE parsing warnings: {len(warnings)} warnings")
+
+        # Check DLL-specific indicators
+        dll_features = results.get("dll_features", {})
+        if dll_features:
+            dll_indicators = dll_features.get("suspicious_indicators", [])
+            for ind in dll_indicators:
+                severity = ind.get("severity", "info").upper()
+                description = ind.get("description", "")
+                if severity in ["HIGH", "MEDIUM"]:
+                    indicators.append(f"[DLL-{severity}] {description}")
+
+            # Check for proxy DLL
+            dll_type = dll_features.get("dll_type_analysis", {})
+            if dll_type.get("is_proxy_dll"):
+                indicators.append("Possible proxy/hijacking DLL detected")
+
+            # Check for suspicious exports
+            exports = dll_features.get("exports", {})
+            suspicious_exports = exports.get("categories", {}).get("suspicious", [])
+            if suspicious_exports:
+                indicators.append(f"Suspicious DLL exports: {', '.join(suspicious_exports[:3])}")
 
         return indicators
 
